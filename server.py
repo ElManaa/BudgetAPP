@@ -16,6 +16,10 @@ from urllib.parse import urlparse, parse_qs
 
 import db
 import api
+import auth
+from http.cookies import SimpleCookie
+
+COOKIE = "gm_session"
 
 
 def friendly(e):
@@ -143,6 +147,95 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- routing ----------
 
+    # ---------- the lock ----------
+
+    def _cookie(self):
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            return SimpleCookie(raw)[COOKIE].value
+        except KeyError:
+            return None
+
+    def _client(self):
+        fwd = self.headers.get("X-Forwarded-For")
+        return fwd.split(",")[0].strip() if fwd else self.client_address[0]
+
+    def _https(self):
+        return (self.headers.get("X-Forwarded-Proto", "").lower() == "https")
+
+    def _set_cookie(self, token, clear=False):
+        bits = ["%s=%s" % (COOKIE, "" if clear else token), "Path=/", "HttpOnly",
+                "SameSite=Lax"]
+        bits.append("Max-Age=0" if clear else "Max-Age=%d" % (auth.SESSION_DAYS * 86400))
+        if self._https():
+            bits.append("Secure")
+        self.send_header("Set-Cookie", "; ".join(bits))
+
+    def _send_with_cookie(self, code, body, token=None, clear=False):
+        data = json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self._set_cookie(token, clear)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _authed(self):
+        return (not auth.is_enabled()) or auth.valid_session(self._cookie())
+
+    def _auth_route(self, verb, route):
+        """Everything under /api/auth. The only part reachable while locked."""
+        body = self._body() if verb != "GET" else {}
+        client = self._client()
+
+        if route == "auth" and verb == "GET":
+            return self._send(200, {
+                "enabled": auth.is_enabled(),
+                "authed": self._authed(),
+                "exposed": HOST not in ("127.0.0.1", "localhost"),
+                "min_length": auth.MIN_LENGTH,
+            })
+
+        if route == "auth/setup" and verb == "POST":
+            if auth.is_enabled():
+                return self._send(400, {"error": "A password is already set."})
+            auth.set_password(body.get("password"))
+            return self._send_with_cookie(200, {"ok": True}, auth.new_session())
+
+        if route == "auth/login" and verb == "POST":
+            wait = auth.locked_for(client)
+            if wait:
+                return self._send(429, {
+                    "error": "Too many wrong tries. Wait %d seconds." % wait})
+            if not auth.verify(body.get("password")):
+                w = auth.note_failure(client)
+                return self._send(401, {
+                    "error": "Wrong password." + (" Locked for %d seconds." % w if w else "")})
+            auth.note_success(client)
+            return self._send_with_cookie(200, {"ok": True}, auth.new_session())
+
+        if route == "auth/logout" and verb == "POST":
+            auth.end_session(self._cookie())
+            return self._send_with_cookie(200, {"ok": True}, clear=True)
+
+        # changing or removing the password needs the current one, even when
+        # already unlocked - a borrowed session must not be able to lock you out
+        if route == "auth/change" and verb == "POST":
+            if auth.is_enabled() and not auth.verify(body.get("current")):
+                return self._send(401, {"error": "That is not the current password."})
+            auth.set_password(body.get("password"))
+            return self._send_with_cookie(200, {"ok": True}, auth.new_session())
+
+        if route == "auth/disable" and verb == "POST":
+            if not auth.disable(body.get("current")):
+                return self._send(401, {"error": "That is not the current password."})
+            return self._send_with_cookie(200, {"ok": True}, clear=True)
+
+        return self._send(404, {"error": "unknown route " + route})
+
     def _profile(self, q=None):
         """Which profile this request is for: header first, then ?profile=."""
         val = self.headers.get("X-Profile")
@@ -157,11 +250,17 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         route = u.path[5:]
         try:
+            if route.split("/")[0] == "auth":
+                return self._auth_route("GET", route)
+            if not self._authed():
+                return self._send(401, {"error": "locked"})
             if route == "profiles":
                 return self._send(200, {"profiles": db.list_profiles(),
                                         "current": self._profile(q)})
             with db.session(self._profile(q)) as con:
                 self._api_get(con, route, q)
+        except ValueError as e:
+            self._send(400, {"error": str(e)})
         except Exception as e:
             self._send(500, {"error": friendly(e)})
 
@@ -181,6 +280,10 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         route = u.path[5:]
         try:
+            if route.split("/")[0] == "auth":
+                return self._auth_route(verb, route)
+            if not self._authed():
+                return self._send(401, {"error": "locked"})
             if route.split("/")[0] == "profiles":
                 return self._profiles_write(verb, route)
             with db.session(self._profile(q)) as con:
@@ -635,11 +738,15 @@ def main():
     print("  " + url)
     print("  Profiles: " + ", ".join(p["name"] for p in profs))
     print("  Data:     %s" % db.DATA)
+    locked = auth.is_enabled()
+    print("  Lock:     %s" % ("password set" if locked else "OFF - no password"))
     if HOST != "127.0.0.1":
         print()
         print("  Listening on %s - reachable from other machines." % HOST)
-        print("  Put it behind Tailscale, Cloudflare Access or a VPN:")
-        print("  this app has NO login of its own.")
+        if not locked:
+            print("  *** WARNING: no password is set. Anyone who can reach this")
+            print("  *** address can see and change your money. Open the app and")
+            print("  *** set one, or keep it behind Tailscale / Cloudflare Access.")
     print("  Press Ctrl+C to stop")
     print("=" * 58)
     if "--no-browser" not in sys.argv:

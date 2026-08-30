@@ -182,7 +182,7 @@ half-written.
 - **Reports** — by category, by budget type, month by month, the category ×
   type cross-tab, and top 25 payees over any range.
 - **Categories & types** — add, rename, recolour and retire both lists.
-- **Settings** — currency, accounts, account balances, backups.
+- **Settings** — currency, accounts, account balances, the password lock, backups.
 
 ## Subscriptions are part of the plan
 
@@ -292,11 +292,47 @@ backup copy now* drops a timestamped copy of **the profile you are in**.
 
 `data/` is in `.gitignore`, so **no financial data is ever committed**.
 
+## Password lock
+
+The app can ask for a password before it shows anything.
+
+**Set it in Settings → Password lock**, before you host it anywhere. On your own
+PC you can leave it off; the app then just opens.
+
+- One password unlocks the app. Profiles are separate *budgets*, not separate
+  logins — either of you can switch between them once inside.
+- You stay signed in on that device for 30 days. **Lock now** ends it
+  immediately; changing the password signs out every device.
+- Five wrong tries locks that address out for a minute, doubling each further
+  try, so the password cannot be guessed by a script.
+- What is stored is a PBKDF2-SHA256 hash (240,000 iterations) with a random
+  salt — never the password. Session tokens are stored hashed too, so a copy of
+  the database yields neither.
+
+### If you forget it
+
+On the machine holding the data:
+
+```bash
+python tools/reset_password.py
+```
+
+That removes the lock and signs every device out. **Your budgets are untouched**
+— they live in separate files the tool never opens. Add `--set NEWPASSWORD` to
+put a new one in place at the same time.
+
+### It is a lock, not a fortress
+
+A password stops someone who finds the URL. It does not make the app safe to
+leave open on the public internet: there is no HTTPS of its own, no 2FA, and no
+per-profile separation of logins. **Keep it behind Tailscale or Cloudflare
+Access as well** — the password is the second lock, not the only one.
+
 ## Hosting it — read this first
 
-**This app has no login of its own.** Anyone who can reach the URL sees and can
-change your money. Do not put it on a public address without putting something
-in front of it. The two free options below both solve that.
+**Set a password first** (Settings → Password lock), *then* pick one of the
+options below. The password stops a stranger who finds the address; the network
+layer below stops them reaching it at all. Use both.
 
 ### Option 1 — keep it on your PC, reach it from anywhere (free, recommended)
 
@@ -313,8 +349,8 @@ set GM_HOST=0.0.0.0 && python server.py
 
 4. On a phone, open `http://<the PC's tailscale name>:8765`.
 
-Only devices on your private Tailscale network can reach it — that is your login.
-Downside: the PC has to be switched on.
+Only devices on your private Tailscale network can reach it, and the password
+guards it even there. Downside: the PC has to be switched on.
 
 ### Option 2 — a free always-on server
 
@@ -395,6 +431,8 @@ db.py                    schema, profiles, connection handling
 web/                     the dashboard (plain HTML/CSS/JS, no build step)
 tools/import_xlsx.py     spreadsheet importer
 tools/seed_debts.py      debt ledger seed, with its reasoning
+tools/reset_password.py  forgotten-password reset
+auth.py                  password hashing and sessions
 Dockerfile               for hosting
 data/                    your data — gitignored, never committed
 ```

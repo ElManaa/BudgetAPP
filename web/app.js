@@ -43,7 +43,21 @@ async function api(path, opts) {
   const h = { 'Content-Type': 'application/json' };
   if (S.profile) h['X-Profile'] = String(S.profile);
   const r = await fetch('/api/' + path, Object.assign({ headers: h }, opts || {}));
-  if (!r.ok) { const e = await r.text(); toast('Error: ' + e, true); throw new Error(e); }
+  if (r.status === 401) {
+    // the session ran out, or the password was changed elsewhere
+    if (!$('#lock')) {
+      const info = await (await fetch('/api/auth')).json();
+      $('#main').innerHTML = '';
+      lockScreen('login', info);
+    }
+    throw new Error('locked');
+  }
+  if (!r.ok) {
+    let e = await r.text();
+    try { e = JSON.parse(e).error || e; } catch (_) { }
+    toast(e, true);
+    throw new Error(e);
+  }
   const ct = r.headers.get('content-type') || '';
   return ct.includes('json') ? r.json() : r.text();
 }
@@ -1130,6 +1144,9 @@ async function vSettings(root) {
           </tr>`).join('')}</tbody></table>
           <button class="btn" id="bal_go" style="margin-top:10px">Save balances for ${ymLabel(S.ym)}</button>
         </div>
+        <div class="card" style="margin-bottom:12px"><h3>Password lock</h3>
+          <div id="authbox"></div>
+        </div>
         <div class="card"><h3>Your data</h3>
           <div class="dim" style="font-size:12px;margin-bottom:10px">
             Everything lives in one file: <code>data/money.db</code>. Copy it anywhere to back it up or move it to another PC.</div>
@@ -1139,6 +1156,7 @@ async function vSettings(root) {
       </div>
     </div>`;
 
+  await renderAuthBox();
   $('#gocats').onclick = e => { e.preventDefault(); nav('cats'); };
   $('#st_go').onclick = async () => {
     await POST('settings', {
@@ -1157,6 +1175,74 @@ async function vSettings(root) {
     const r = await GET('backup');
     $('#bkout').textContent = 'Saved to ' + r.file;
     toast('Backup created');
+  };
+}
+
+async function renderAuthBox() {
+  const box = $('#authbox');
+  if (!box) return;
+  const a = await (await fetch('/api/auth')).json();
+  S.auth = a;
+
+  box.innerHTML = a.enabled ? `
+    <div class="dim" style="font-size:12px;margin-bottom:10px">
+      <span class="tag g">on</span> The app asks for a password when it opens.
+      Changing it signs out every device.</div>
+    <div class="form" style="flex-direction:column;align-items:stretch">
+      <div class="fld"><label>Current password</label><input type="password" id="pw_cur" autocomplete="current-password"></div>
+      <div class="fld"><label>New password</label><input type="password" id="pw_new" autocomplete="new-password" placeholder="at least ${a.min_length} characters"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" id="pw_change">Change password</button>
+        <button class="btn sec" id="pw_lock">Lock now</button>
+        <div class="spacer"></div>
+        <button class="btn sec" id="pw_off">Remove the lock</button>
+      </div>
+    </div>` : `
+    <div class="dim" style="font-size:12px;margin-bottom:10px">
+      <span class="tag y">off</span> Anyone who opens this app sees your money.
+      Fine on your own PC — <b>set one before you host it anywhere</b>.</div>
+    ${a.exposed ? `<div class="alert danger">This app is listening on a public
+      address with no password. Set one now.</div>` : ''}
+    <div class="form" style="flex-direction:column;align-items:stretch">
+      <div class="fld"><label>New password</label><input type="password" id="pw_new" autocomplete="new-password" placeholder="at least ${a.min_length} characters"></div>
+      <div class="fld"><label>Type it again</label><input type="password" id="pw_new2" autocomplete="new-password"></div>
+      <button class="btn" id="pw_set">Set password</button>
+    </div>`;
+
+  const post = async (path, body) => {
+    const r = await fetch('/api/auth/' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) { toast(d.error || 'Failed', true); throw new Error(d.error); }
+    return d;
+  };
+
+  if ($('#pw_set')) $('#pw_set').onclick = async () => {
+    const p = $('#pw_new').value;
+    if (p.length < a.min_length) return toast(`At least ${a.min_length} characters`, true);
+    if (p !== $('#pw_new2').value) return toast('The two do not match', true);
+    try { await post('setup', { password: p }); toast('Password set'); renderAuthBox(); } catch (e) { }
+  };
+  if ($('#pw_change')) $('#pw_change').onclick = async () => {
+    const p = $('#pw_new').value;
+    if (p.length < a.min_length) return toast(`At least ${a.min_length} characters`, true);
+    try {
+      await post('change', { current: $('#pw_cur').value, password: p });
+      toast('Password changed — other devices signed out'); renderAuthBox();
+    } catch (e) { }
+  };
+  if ($('#pw_off')) $('#pw_off').onclick = async () => {
+    if (!confirm('Remove the password?\n\nAnyone who can open the app will see your money.')) return;
+    try {
+      await post('disable', { current: $('#pw_cur').value });
+      toast('Lock removed'); renderAuthBox();
+    } catch (e) { }
+  };
+  if ($('#pw_lock')) $('#pw_lock').onclick = async () => {
+    await post('logout', {});
+    location.reload();
   };
 }
 
@@ -1368,7 +1454,58 @@ document.addEventListener('click', e => {
   if (l && !l.hidden && !e.target.closest('#profbox')) l.hidden = true;
 });
 
-(async function start() {
+/* ---------- the lock screen ---------- */
+
+function lockScreen(mode, info) {
+  // mode: 'login' = a password exists | 'setup' = choose one now
+  const setup = mode === 'setup';
+  document.body.insertAdjacentHTML('beforeend', `
+    <div class="lock" id="lock">
+      <form class="lockbox" id="lockform">
+        <div class="lockmark">🔒</div>
+        <h1>Gestion<span>Money</span></h1>
+        <p class="lockmsg">${setup
+          ? 'Choose a password. You will need it every time you open the app.'
+          : 'Enter your password to unlock.'}</p>
+        ${setup && info.exposed ? `<div class="alert warn" style="text-align:left">
+          This app is reachable from other machines. Set a password now.</div>` : ''}
+        <input type="password" id="lockpw" placeholder="Password" autocomplete="${setup ? 'new-password' : 'current-password'}" autofocus>
+        ${setup ? '<input type="password" id="lockpw2" placeholder="Type it again" autocomplete="new-password">' : ''}
+        <button class="btn" type="submit" id="lockgo">${setup ? 'Set password' : 'Unlock'}</button>
+        <div class="lockerr" id="lockerr"></div>
+        ${setup ? `<p class="lockhint">At least ${info.min_length} characters. Stored as a
+          PBKDF2 hash — if you forget it, delete <code>data/profiles.db</code>’s
+          password with the reset tool; your budgets are untouched.</p>` : ''}
+      </form>
+    </div>`);
+
+  const err = m => { $('#lockerr').textContent = m; };
+  $('#lockform').onsubmit = async e => {
+    e.preventDefault();
+    const pw = $('#lockpw').value;
+    if (setup) {
+      if (pw.length < info.min_length) return err(`At least ${info.min_length} characters.`);
+      if (pw !== $('#lockpw2').value) return err('The two do not match.');
+    }
+    $('#lockgo').disabled = true;
+    try {
+      const r = await fetch('/api/auth/' + (setup ? 'setup' : 'login'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pw }),
+      });
+      const d = await r.json();
+      if (!r.ok) { err(d.error || 'Could not unlock.'); $('#lockgo').disabled = false; return; }
+      $('#lock').remove();
+      startApp();
+    } catch (ex) {
+      err('Could not reach the app.');
+      $('#lockgo').disabled = false;
+    }
+  };
+  $('#lockpw').focus();
+}
+
+async function startApp() {
   const r = await GET('profiles');
   S.profiles = r.profiles;
   let saved = null;
@@ -1378,4 +1515,14 @@ document.addEventListener('click', e => {
   renderProfiles();
   await boot();
   render();
+}
+
+(async function start() {
+  const info = await (await fetch('/api/auth')).json();
+  S.auth = info;
+  if (info.enabled && !info.authed) return lockScreen('login', info);
+  // No password yet. On this machine that is fine; reachable from elsewhere it
+  // is not, so insist on one before showing any figures.
+  if (!info.enabled && info.exposed) return lockScreen('setup', info);
+  startApp();
 })();

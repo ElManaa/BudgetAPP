@@ -151,6 +151,23 @@ input[type=number]{text-align:right}
 .scroll{max-height:460px;overflow:auto}
 .mono{font-variant-numeric:tabular-nums}
 .right{text-align:right}
+/* lock screen */
+.lock{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;
+  justify-content:center;z-index:200;padding:20px}
+.lockbox{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:30px 28px;width:100%;max-width:370px;text-align:center;
+  box-shadow:0 20px 60px rgba(0,0,0,.6)}
+.lockmark{font-size:30px;margin-bottom:6px}
+.lockbox h1{font-size:19px;margin:0 0 10px;letter-spacing:.3px}
+.lockbox h1 span{color:var(--acc)}
+.lockmsg{color:var(--dim);font-size:13px;margin:0 0 18px;line-height:1.5}
+.lockbox input{width:100%;margin-bottom:10px;text-align:center;padding:11px}
+.lockbox .btn{width:100%;padding:11px}
+.lockbox .btn:disabled{opacity:.5;cursor:default}
+.lockerr{color:var(--bad);font-size:12px;min-height:17px;margin-top:9px}
+.lockhint{color:var(--dim2);font-size:11px;line-height:1.5;margin:12px 0 0}
+.lockhint code{background:var(--panel2);padding:1px 4px;border-radius:3px}
+
 .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ok);
   color:#06210f;padding:11px 20px;border-radius:9px;font-weight:600;z-index:99;
   box-shadow:0 6px 24px rgba(0,0,0,.5)}
