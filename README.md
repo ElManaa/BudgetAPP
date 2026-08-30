@@ -362,14 +362,24 @@ If you want it up when the PC is off:
 | **Google Cloud e2-micro free tier** | free | smaller, same idea |
 | Fly.io / Railway / Hetzner | ~$3–5/month | simplest, but not free |
 
-A `Dockerfile` is included, so on any of these:
+A `Dockerfile` is included — Python only, no packages to install:
 
 ```bash
-docker build -t gestionmoney . && docker run -d -p 8765:8765 -v gm-data:/app/data gestionmoney
+docker build -t gestionmoney .
 ```
 
-The `-v gm-data:/app/data` is **not optional** — without it your budget is
-deleted every time the container restarts.
+```bash
+docker run -d --name gestionmoney -p 8765:8765 -v gm-data:/app/data --restart unless-stopped gestionmoney
+```
+
+The `-v gm-data:/app/data` is **not optional**. Without it, the first redeploy
+wipes every budget *and* your password — the container starts blank. Verified,
+not assumed.
+
+The image runs as a non-root user, has a healthcheck, and refuses to build if
+any module is missing rather than shipping something that cannot start. Open
+`http://<host>:8765`, set a password immediately, and check `docker logs
+gestionmoney` — it warns in plain text while no password is set.
 
 Then put a login in front of it with **Cloudflare Tunnel + Cloudflare Access**
 (free): you get an HTTPS address, and only the email addresses you list can open
