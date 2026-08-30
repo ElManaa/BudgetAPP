@@ -130,6 +130,40 @@ def unlink_sub_from_plan(con, sub_id, deactivate=True):
     return {"ok": True}
 
 
+def set_income(con, ym, income, force=False):
+    """Set the salary for this month and every upcoming one.
+
+    By default a month that was deliberately given a different figure keeps it -
+    only the months still carrying the old salary follow along. `force` applies
+    the new figure to every upcoming month regardless. Past months are never
+    touched; what you earned then is history.
+    """
+    m = ensure_month(con, ym)
+    old = m["income"]
+    income = round(float(income or 0), 2)
+
+    con.execute("UPDATE months SET income=? WHERE id=?", (income, m["id"]))
+    if force:
+        cur = con.execute(
+            "UPDATE months SET income=? WHERE closed=0 AND ym>? AND income<>?",
+            (income, ym, income))
+    else:
+        cur = con.execute(
+            "UPDATE months SET income=? WHERE closed=0 AND ym>? AND income=?",
+            (income, ym, old))
+    # brand-new months should start from the new figure too
+    con.execute("INSERT INTO settings(key,value) VALUES('default_income',?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(income),))
+    con.commit()
+
+    kept = rows(con.execute(
+        "SELECT ym, income FROM months WHERE closed=0 AND ym>? AND income<>?"
+        " ORDER BY ym", (ym, income)))
+    return {"from": old, "to": income, "updated_later": cur.rowcount,
+            "left_alone": [k["ym"] for k in kept]}
+
+
 def propagate_recurring(con, rid, ym, include_current=False):
     """Push a master-list change into the months it should still reach.
 

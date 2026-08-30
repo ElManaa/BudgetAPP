@@ -115,6 +115,11 @@ Both live on the Month plan screen, in that order.
 
 1. A new month is created automatically from the master list, the first time you
    look at it. You never rebuild the layout by hand.
+1. **Salary is not retyped every month.** Setting it in Month plan applies to
+   that month and every upcoming one, and becomes the figure new months start
+   from. A month you deliberately gave its own salary keeps it — you are asked
+   before those are overwritten. Past months never change.
+   *Extra income* is the opposite: a bonus or refund, that month only.
 2. Adjust anything for that month only in **Month plan** — the master list is
    untouched.
 3. If a change is permanent, hit *Save amounts as template* and future months
@@ -182,7 +187,8 @@ half-written.
 - **Reports** — by category, by budget type, month by month, the category ×
   type cross-tab, and top 25 payees over any range.
 - **Categories & types** — add, rename, recolour and retire both lists.
-- **Settings** — currency, accounts, account balances, the password lock, backups.
+- **Settings** — currency, accounts, account balances, the password lock, a
+  server & storage panel (proves your hosted volume is persisting), backups.
 
 ## Subscriptions are part of the plan
 

@@ -301,10 +301,10 @@ async function vMonth(root) {
     `<div class="grid g4" style="margin-bottom:12px">
       <div class="card kpi"><h3>Salary</h3>
         <input type="number" step="0.01" id="inc" value="${n2(d.month.income)}" style="width:100%;font-size:20px">
-        <div class="s">edit and press Enter</div></div>
+        <div class="s">applies to this month and every upcoming one</div></div>
       <div class="card kpi"><h3>Extra income</h3>
         <input type="number" step="0.01" id="xinc" value="${n2(d.month.extra_income)}" style="width:100%;font-size:20px">
-        <div class="s">bonus, refunds…</div></div>
+        <div class="s">bonus or refund — this month only</div></div>
       <div class="card kpi"><h3>Planned out</h3><div class="v">${money(t.planned)}</div>
         <div class="s">fixed + budgets</div></div>
       <div class="card kpi"><h3>Free after plan</h3><div class="v ${t.free < 0 ? 'bad' : 'ok'}">${money(t.free)}</div>
@@ -382,12 +382,26 @@ async function vMonth(root) {
       ${d.unassigned.length ? `<div class="hr"></div><h3 style="color:var(--warn)">Not linked to any envelope (${d.unassigned.length})</h3>${txTable(d.unassigned)}` : ''}
     </div>`;
 
-  const save = async (el, field) => {
-    await PUT('months/' + d.month.id, { [field]: el.value });
-    toast('Saved'); render();
+  $('#inc').onchange = async e => {
+    const val = e.target.value;
+    let r = await PUT('months/' + d.month.id, { income: val });
+    // months that had been given their own figure are skipped, then offered
+    if (r.left_alone && r.left_alone.length) {
+      const list = r.left_alone.slice(0, 6).map(ymLabel).join(', ')
+        + (r.left_alone.length > 6 ? ` and ${r.left_alone.length - 6} more` : '');
+      if (confirm(`${r.left_alone.length} upcoming month(s) have their own salary:\n\n${list}\n\n`
+        + `Set them to ${money(val)} as well?`)) {
+        r = await PUT('months/' + d.month.id, { income: val, force_all: 1 });
+      }
+    }
+    let msg = 'Salary set for ' + ymLabel(S.ym);
+    if (r.updated_later) msg += ' and ' + r.updated_later + ' upcoming month(s)';
+    toast(msg); render();
   };
-  $('#inc').onchange = e => save(e.target, 'income');
-  $('#xinc').onchange = e => save(e.target, 'extra_income');
+  $('#xinc').onchange = async e => {
+    await PUT('months/' + d.month.id, { extra_income: e.target.value });
+    toast('Extra income saved for ' + ymLabel(S.ym)); render();
+  };
   $$('.ep').forEach(i => i.onchange = async () => {
     await PUT('envelopes/' + i.dataset.id, { planned: i.value }); toast('Updated'); render();
   });
@@ -1147,6 +1161,9 @@ async function vSettings(root) {
         <div class="card" style="margin-bottom:12px"><h3>Password lock</h3>
           <div id="authbox"></div>
         </div>
+        <div class="card" style="margin-bottom:12px"><h3>Server &amp; storage</h3>
+          <div id="srvbox" class="dim">loading…</div>
+        </div>
         <div class="card"><h3>Your data</h3>
           <div class="dim" style="font-size:12px;margin-bottom:10px">
             Everything lives in one file: <code>data/money.db</code>. Copy it anywhere to back it up or move it to another PC.</div>
@@ -1157,6 +1174,7 @@ async function vSettings(root) {
     </div>`;
 
   await renderAuthBox();
+  await renderServerBox();
   $('#gocats').onclick = e => { e.preventDefault(); nav('cats'); };
   $('#st_go').onclick = async () => {
     await POST('settings', {
@@ -1176,6 +1194,49 @@ async function vSettings(root) {
     $('#bkout').textContent = 'Saved to ' + r.file;
     toast('Backup created');
   };
+}
+
+function humanAge(sec) {
+  if (sec < 90) return sec + ' seconds';
+  if (sec < 5400) return Math.round(sec / 60) + ' minutes';
+  if (sec < 172800) return Math.round(sec / 3600) + ' hours';
+  return Math.round(sec / 86400) + ' days';
+}
+
+async function renderServerBox() {
+  const box = $('#srvbox');
+  if (!box) return;
+  const s = await GET('serverinfo');
+  const kb = s.db_bytes >= 1048576
+    ? (s.db_bytes / 1048576).toFixed(1) + ' MB'
+    : Math.round(s.db_bytes / 1024) + ' KB';
+  const fresh = s.uptime_seconds < 900;
+  const hasData = s.counts.tx > 0 || s.counts.recurring > 0;
+
+  box.innerHTML = `
+    <table style="margin-bottom:10px"><tbody>
+      <tr><td class="dim2">Running since</td><td class="right">${esc(s.started_at.replace('T', ' '))}
+        <span class="dim2">(${humanAge(s.uptime_seconds)} ago)</span></td></tr>
+      <tr><td class="dim2">Storage folder</td><td class="right mono" style="font-size:11px">${esc(s.data_dir)}</td></tr>
+      <tr><td class="dim2">This profile's file</td><td class="right mono" style="font-size:11px">${esc(s.db_file)} · ${kb}</td></tr>
+      <tr><td class="dim2">Holding</td><td class="right">${s.counts.tx} transactions ·
+        ${s.counts.recurring} fixed lines · ${s.counts.months} months ·
+        ${s.counts.subs} subscriptions · ${s.counts.debts} debts</td></tr>
+      ${s.oldest_record ? `<tr><td class="dim2">Oldest record written</td>
+        <td class="right mono" style="font-size:11px">${esc(s.oldest_record)}</td></tr>` : ''}
+    </tbody></table>
+    ${fresh && hasData ? `<div class="alert info">
+      <b>Storage is persisting.</b> The server restarted ${humanAge(s.uptime_seconds)} ago,
+      yet your ${s.counts.tx} transaction(s) and ${s.counts.recurring} fixed line(s) are
+      still here — so the data outlived the process, which is the whole point of the volume.</div>`
+    : fresh && !hasData ? `<div class="alert warn">
+      Restarted ${humanAge(s.uptime_seconds)} ago and this profile is <b>empty</b>.
+      If you had entered data before the restart, the storage is <b>not</b> persisting —
+      on Railway, attach a Volume mounted at <code>/app/data</code>.</div>`
+    : ''}
+    <div class="dim2" style="font-size:11px;margin-top:8px">
+      After a deploy, “running since” resets while everything else should not.
+      That is how you tell a real restart from a page that simply did not reload.</div>`;
 }
 
 async function renderAuthBox() {

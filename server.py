@@ -42,6 +42,10 @@ PORT = int(os.environ.get("GM_PORT") or os.environ.get("PORT") or "8765")
 # banner then warns that the app has no login of its own.
 HOST = os.environ.get("GM_HOST", "127.0.0.1")
 
+# When this process started. After a deploy this resets while your data does
+# not - which is exactly how you tell a working volume from a lucky one.
+STARTED = datetime.datetime.now()
+
 # Tables exposed through the generic CRUD endpoints, with their writable columns.
 TABLES = {
     "recurring": ["label", "category", "kind", "amount", "due_day", "active", "sort", "note"],
@@ -406,6 +410,27 @@ class Handler(BaseHTTPRequestHandler):
                 " FROM tx WHERE label LIKE ? GROUP BY LOWER(label)"
                 " ORDER BY n DESC, d DESC LIMIT 8", (term,))))
 
+        if route == "serverinfo":
+            pid = self._profile(q)
+            path = db.db_path(pid)
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            counts = {}
+            for t in ("tx", "months", "recurring", "subs", "debts"):
+                counts[t] = api.one(con.execute("SELECT COUNT(*) c FROM %s" % t))["c"]
+            oldest = api.one(con.execute("SELECT MIN(created_at) c FROM tx"))["c"]
+            up = (datetime.datetime.now() - STARTED).total_seconds()
+            return self._send(200, {
+                "started_at": STARTED.isoformat(timespec="seconds"),
+                "uptime_seconds": int(up),
+                "data_dir": db.DATA,
+                "db_file": os.path.basename(path),
+                "db_bytes": size,
+                "counts": counts,
+                "oldest_record": oldest,
+                "profiles": len(db.list_profiles()),
+                "persistent": bool(counts["tx"] or counts["recurring"]) and up < 3600,
+            })
+
         if route == "backup":
             os.makedirs(os.path.join(HERE, "data", "backups"), exist_ok=True)
             stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -635,6 +660,22 @@ class Handler(BaseHTTPRequestHandler):
             d = clean(table, body)
             if not d:
                 return self._send(400, {"error": "nothing to update"})
+
+            # Salary is not a per-month fact you retype twelve times: setting it
+            # carries to every upcoming month as well.
+            if table == "months" and "income" in d:
+                row = api.one(con.execute("SELECT ym FROM months WHERE id=?", (rid,)))
+                if row:
+                    res = api.set_income(con, row["ym"], d["income"],
+                                         force=bool(body.get("force_all")))
+                    rest = {k: v for k, v in d.items() if k != "income"}
+                    if rest:
+                        con.execute(
+                            "UPDATE months SET %s WHERE id=?"
+                            % ",".join("%s=?" % k for k in rest),
+                            list(rest.values()) + [rid])
+                        con.commit()
+                    return self._send(200, dict({"ok": True}, **res))
             sets = ",".join("%s=?" % k for k in d)
             con.execute("UPDATE %s SET %s WHERE id=?" % (table, sets),
                         list(d.values()) + [rid])
