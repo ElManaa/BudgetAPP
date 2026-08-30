@@ -396,16 +396,31 @@ it. That is the cheapest way to have a real URL you can both use safely.
 Railway builds the included `Dockerfile` and reads `railway.json` for its health
 check. Two things matter:
 
-**1. Add a Volume, or you lose everything.** In the service, *Settings → Volumes
+**1. Add a Volume, then actually apply it.** In the service, *Settings → Volumes
 → Add Volume* with the mount path exactly:
 
 ```
 /app/data
 ```
 
-Without it, every redeploy starts blank — budgets *and* password gone. Railway
-also rejects a `VOLUME` line in a Dockerfile, which is why there isn't one; the
+Railway **stages** config changes. Adding the volume leaves an *"Apply N
+changes"* bar at the top with a **Deploy** button, and the service shows
+*Edited*. Until you press Deploy the volume is not attached, and deploys keep
+starting blank — which looks exactly like a broken volume. Press Deploy.
+
+Without a volume, every redeploy wipes budgets *and* the password. Railway also
+rejects a `VOLUME` line in a Dockerfile, which is why there isn't one; the
 volume has to be attached on their side.
+
+The app checks this for you. *Settings → Server & storage* says either
+**"Persistent volume attached"** or, in red, **"This folder is not a mounted
+volume"** — it compares filesystems, so it is telling you what is actually
+mounted rather than what was configured. The deploy log says the same thing on
+startup:
+
+```
+Storage:  persistent volume mounted on /app/data
+```
 
 **2. Set a password the moment it is live.** Railway gives the service a public
 URL. Open it, set a password in the setup screen that appears, and check the

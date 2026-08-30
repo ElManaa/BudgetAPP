@@ -1225,14 +1225,20 @@ async function renderServerBox() {
       ${s.oldest_record ? `<tr><td class="dim2">Oldest record written</td>
         <td class="right mono" style="font-size:11px">${esc(s.oldest_record)}</td></tr>` : ''}
     </tbody></table>
-    ${fresh && hasData ? `<div class="alert info">
+    ${s.in_container && s.mounted === false ? `<div class="alert danger">
+      <b>This folder is not a mounted volume.</b> <code>${esc(s.data_dir)}</code> is
+      ordinary container disk, so everything in it — budgets <i>and</i> your password —
+      is deleted on the next deploy. On Railway: service →
+      <b>Settings → Volumes → Add Volume</b>, mount path exactly
+      <code>${esc(s.data_dir)}</code>. Check it is attached to <i>this</i> service.</div>`
+    : s.in_container && s.mounted ? `<div class="alert info">
+      <b>Persistent volume attached</b> at <code>${esc(s.data_dir)}</code> — it is on
+      its own filesystem, so it survives deploys.${fresh && !hasData
+        ? ' The profile is empty, but that is the volume starting fresh, not losing data.' : ''}</div>`
+    : fresh && hasData ? `<div class="alert info">
       <b>Storage is persisting.</b> The server restarted ${humanAge(s.uptime_seconds)} ago,
       yet your ${s.counts.tx} transaction(s) and ${s.counts.recurring} fixed line(s) are
-      still here — so the data outlived the process, which is the whole point of the volume.</div>`
-    : fresh && !hasData ? `<div class="alert warn">
-      Restarted ${humanAge(s.uptime_seconds)} ago and this profile is <b>empty</b>.
-      If you had entered data before the restart, the storage is <b>not</b> persisting —
-      on Railway, attach a Volume mounted at <code>/app/data</code>.</div>`
+      still here — so the data outlived the process.</div>`
     : ''}
     <div class="dim2" style="font-size:11px;margin-top:8px">
       After a deploy, “running since” resets while everything else should not.

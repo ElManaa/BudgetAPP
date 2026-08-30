@@ -46,6 +46,30 @@ HOST = os.environ.get("GM_HOST", "127.0.0.1")
 # not - which is exactly how you tell a working volume from a lucky one.
 STARTED = datetime.datetime.now()
 
+
+def in_container():
+    if os.path.exists("/.dockerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup") as f:
+            return any(k in f.read() for k in ("docker", "kubepods", "containerd"))
+    except OSError:
+        return False
+
+
+def storage_is_mounted():
+    """True when data/ sits on a different filesystem than the app directory.
+
+    That is what a real volume looks like from the inside. If the two share a
+    device, the folder is just container disk and everything in it disappears
+    with the container - which is exactly the failure people hit when they
+    forget to attach a volume, or attach it to the wrong path.
+    """
+    try:
+        return os.stat(db.DATA).st_dev != os.stat(os.path.dirname(db.DATA)).st_dev
+    except OSError:
+        return None
+
 # Tables exposed through the generic CRUD endpoints, with their writable columns.
 TABLES = {
     "recurring": ["label", "category", "kind", "amount", "due_day", "active", "sort", "note"],
@@ -428,6 +452,8 @@ class Handler(BaseHTTPRequestHandler):
                 "counts": counts,
                 "oldest_record": oldest,
                 "profiles": len(db.list_profiles()),
+                "in_container": in_container(),
+                "mounted": storage_is_mounted(),
                 "persistent": bool(counts["tx"] or counts["recurring"]) and up < 3600,
             })
 
@@ -783,6 +809,17 @@ def main():
     print("  Data:     %s" % db.DATA)
     locked = auth.is_enabled()
     print("  Lock:     %s" % ("password set" if locked else "OFF - no password"))
+
+    if in_container():
+        mounted = storage_is_mounted()
+        print("  Storage:  %s" % (
+            "persistent volume mounted on %s" % db.DATA if mounted
+            else "NOT a mounted volume"))
+        if not mounted:
+            print()
+            print("  *** WARNING: %s is ordinary container disk." % db.DATA)
+            print("  *** Everything saved here is DELETED on the next deploy.")
+            print("  *** Attach a volume with the mount path exactly:  %s" % db.DATA)
     if HOST != "127.0.0.1":
         print()
         print("  Listening on %s - reachable from other machines." % HOST)
