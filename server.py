@@ -35,7 +35,9 @@ def friendly(e):
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
-PORT = int(os.environ.get("GM_PORT", "8765"))
+# Hosts like Railway, Render and Heroku pick the port and pass it as PORT.
+# Ignoring it means the platform cannot reach the app at all.
+PORT = int(os.environ.get("GM_PORT") or os.environ.get("PORT") or "8765")
 # 127.0.0.1 keeps it on this machine. Hosting it needs 0.0.0.0, which is why the
 # banner then warns that the app has no login of its own.
 HOST = os.environ.get("GM_HOST", "127.0.0.1")

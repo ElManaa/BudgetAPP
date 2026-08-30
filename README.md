@@ -385,6 +385,33 @@ Then put a login in front of it with **Cloudflare Tunnel + Cloudflare Access**
 (free): you get an HTTPS address, and only the email addresses you list can open
 it. That is the cheapest way to have a real URL you can both use safely.
 
+### Deploying to Railway
+
+Railway builds the included `Dockerfile` and reads `railway.json` for its health
+check. Two things matter:
+
+**1. Add a Volume, or you lose everything.** In the service, *Settings → Volumes
+→ Add Volume* with the mount path exactly:
+
+```
+/app/data
+```
+
+Without it, every redeploy starts blank — budgets *and* password gone. Railway
+also rejects a `VOLUME` line in a Dockerfile, which is why there isn't one; the
+volume has to be attached on their side.
+
+**2. Set a password the moment it is live.** Railway gives the service a public
+URL. Open it, set a password in the setup screen that appears, and check the
+deploy logs — they say `Lock: OFF - no password` in plain text until you do.
+
+You do not need to set `PORT`; Railway injects it and the app follows it.
+`GM_HOST` is already `0.0.0.0` in the image.
+
+Cost, so it is not a surprise: Railway has no free tier any more — a one-off
+trial credit, then about $5/month, and volumes need a paid plan. If free really
+matters more than always-on, Option 1 above costs nothing.
+
 ### What to avoid
 
 **Render's free tier** (and similar free web services) give you a filesystem that
