@@ -1,0 +1,593 @@
+"""Business logic for GestionMoney. Stdlib only."""
+import datetime
+import calendar
+import db
+
+
+# ---------- helpers ----------
+
+def rows(cur):
+    return [dict(r) for r in cur.fetchall()]
+
+
+def one(cur):
+    r = cur.fetchone()
+    return dict(r) if r else None
+
+
+def ym_add(ym, n):
+    y, m = int(ym[:4]), int(ym[5:7])
+    t = (y * 12 + (m - 1)) + n
+    return "%04d-%02d" % (t // 12, t % 12 + 1)
+
+
+def ym_label(ym):
+    y, m = int(ym[:4]), int(ym[5:7])
+    return "%s %d" % (calendar.month_name[m], y)
+
+
+def month_bounds(ym):
+    y, m = int(ym[:4]), int(ym[5:7])
+    return "%s-01" % ym, "%s-%02d" % (ym, calendar.monthrange(y, m)[1])
+
+
+# ---------- subscriptions <-> monthly plan ----------
+
+PERIOD_PER_MONTH = {"monthly": 1.0, "yearly": 1 / 12.0,
+                    "quarterly": 1 / 3.0, "weekly": 52 / 12.0}
+
+
+def monthly_cost(amount, period):
+    """What a subscription costs per month, whatever its billing cycle."""
+    return round((amount or 0) * PERIOD_PER_MONTH.get(period, 1.0), 2)
+
+
+def sub_start_ym(sub):
+    for key in ("started", "next_date", "date"):
+        v = sub.get(key)
+        if v:
+            return v[:7]
+    return datetime.date.today().strftime("%Y-%m")
+
+
+def default_kind(con):
+    """The type a new bill-like line should get, whatever you have renamed it to."""
+    r = one(con.execute(
+        "SELECT name FROM kinds WHERE is_saving=0 AND archived=0 ORDER BY sort, id"))
+    return r["name"] if r else "bill"
+
+
+def link_sub_to_plan(con, sub_id, kind=None):
+    """Give a subscription its line in the monthly plan, or update the one it has.
+
+    A monthly sub costs its full amount every month; a yearly or weekly one is
+    carried at its monthly equivalent so the plan still adds up.
+    """
+    s = one(con.execute("SELECT * FROM subs WHERE id=?", (sub_id,)))
+    if not s:
+        return None
+    kind = kind or default_kind(con)
+    amount = monthly_cost(s["amount"], s["period"])
+
+    rec = None
+    if s["recurring_id"]:
+        rec = one(con.execute("SELECT * FROM recurring WHERE id=?", (s["recurring_id"],)))
+    if rec is None:
+        # reuse a same-named line if one already exists, rather than duplicating
+        rec = one(con.execute("SELECT * FROM recurring WHERE label=?", (s["label"],)))
+
+    if rec:
+        con.execute(
+            "UPDATE recurring SET label=?, amount=?, category=?, kind=?, active=1"
+            " WHERE id=?",
+            (s["label"], amount, s["category"], rec["kind"] or kind, rec["id"]))
+        rid = rec["id"]
+    else:
+        mx = one(con.execute("SELECT COALESCE(MAX(sort),0) s FROM recurring"))
+        day = int(s["next_date"][8:10]) if s["next_date"] else None
+        rid = con.execute(
+            "INSERT INTO recurring(label,category,kind,amount,due_day,active,sort,note)"
+            " VALUES(?,?,?,?,?,1,?,?)",
+            (s["label"], s["category"], kind, amount, day, mx["s"] + 10,
+             "subscription")).lastrowid
+
+    con.execute("UPDATE subs SET recurring_id=?, in_plan=1 WHERE id=?", (rid, sub_id))
+    con.commit()
+
+    # From its start month onward - including months you have already generated
+    # by looking at them - but never into a month before it started.
+    start = sub_start_ym(dict(s))
+    touched = sync_months_from(con, start)
+
+    # A price change should reach any open month you have not paid it in yet;
+    # a month where the charge is already logged keeps the figure you paid.
+    con.execute(
+        "UPDATE envelopes SET planned=?, label=?, category=? WHERE recurring_id=?"
+        " AND month_id IN (SELECT id FROM months WHERE closed=0 AND ym>=?)"
+        " AND id NOT IN (SELECT DISTINCT envelope_id FROM tx"
+        "                WHERE envelope_id IS NOT NULL)",
+        (amount, s["label"], s["category"], rid, start))
+    con.commit()
+    return {"recurring_id": rid, "amount": amount, "months": sorted(touched)}
+
+
+def unlink_sub_from_plan(con, sub_id, deactivate=True):
+    """Take a subscription out of the monthly plan, keeping its history."""
+    s = one(con.execute("SELECT * FROM subs WHERE id=?", (sub_id,)))
+    if not s:
+        return None
+    if s["recurring_id"] and deactivate:
+        con.execute("UPDATE recurring SET active=0 WHERE id=?", (s["recurring_id"],))
+        # drop it from open months only; closed history keeps its envelopes
+        con.execute(
+            "DELETE FROM envelopes WHERE recurring_id=? AND month_id IN"
+            " (SELECT id FROM months WHERE closed=0)"
+            " AND id NOT IN (SELECT DISTINCT envelope_id FROM tx"
+            "                WHERE envelope_id IS NOT NULL)",
+            (s["recurring_id"],))
+    con.execute("UPDATE subs SET in_plan=0 WHERE id=?", (sub_id,))
+    con.commit()
+    return {"ok": True}
+
+
+def propagate_recurring(con, rid, ym, include_current=False):
+    """Push a master-list change into the months it should still reach.
+
+    Future months may already have been generated by looking at them, and they
+    would otherwise keep whatever the amount was on the day they appeared. Any
+    month where the line has already been paid keeps the figure you paid.
+    """
+    r = one(con.execute("SELECT * FROM recurring WHERE id=?", (rid,)))
+    if not r:
+        return {"updated": 0}
+    op = ">=" if include_current else ">"
+    cur = con.execute(
+        "UPDATE envelopes SET label=?, category=?, kind=?, planned=?"
+        " WHERE recurring_id=? AND month_id IN"
+        "   (SELECT id FROM months WHERE closed=0 AND ym %s ?)"
+        " AND id NOT IN (SELECT DISTINCT envelope_id FROM tx"
+        "                WHERE envelope_id IS NOT NULL)" % op,
+        (r["label"], r["category"], r["kind"], r["amount"], rid, ym))
+    con.commit()
+    return {"updated": cur.rowcount}
+
+
+def promote_envelope(con, env_id):
+    """Turn a this-month-only envelope into a line every future month gets."""
+    e = one(con.execute("SELECT * FROM envelopes WHERE id=?", (env_id,)))
+    if not e:
+        return None
+    if e["recurring_id"]:
+        return {"recurring_id": e["recurring_id"], "created": False}
+    rec = one(con.execute("SELECT * FROM recurring WHERE label=?", (e["label"],)))
+    if rec:
+        con.execute("UPDATE recurring SET active=1, amount=? WHERE id=?",
+                    (e["planned"], rec["id"]))
+        rid = rec["id"]
+    else:
+        mx = one(con.execute("SELECT COALESCE(MAX(sort),0) s FROM recurring"))
+        rid = con.execute(
+            "INSERT INTO recurring(label,category,kind,amount,active,sort)"
+            " VALUES(?,?,?,?,1,?)",
+            (e["label"], e["category"], e["kind"], e["planned"],
+             mx["s"] + 10)).lastrowid
+    con.execute("UPDATE envelopes SET recurring_id=? WHERE id=?", (rid, env_id))
+    con.commit()
+
+    # months after this one that already exist should pick it up as well
+    ym = one(con.execute("SELECT ym FROM months WHERE id=?", (e["month_id"],)))["ym"]
+    return {"recurring_id": rid, "created": True,
+            "also_added_to": sync_months_from(con, ym)}
+
+
+def demote_recurring(con, rid, keep_ym):
+    """Stop a line repeating, leaving the months that already have it alone."""
+    con.execute("UPDATE recurring SET active=0 WHERE id=?", (rid,))
+    con.execute(
+        "DELETE FROM envelopes WHERE recurring_id=? AND month_id IN"
+        " (SELECT id FROM months WHERE closed=0 AND ym>?)"
+        " AND id NOT IN (SELECT DISTINCT envelope_id FROM tx"
+        "                WHERE envelope_id IS NOT NULL)",
+        (rid, keep_ym))
+    con.commit()
+    return {"ok": True}
+
+
+def sub_for_recurring(con, rid):
+    return one(con.execute("SELECT * FROM subs WHERE recurring_id=?", (rid,)))
+
+
+def make_recurring_a_sub(con, rid, next_date=None, period="monthly"):
+    """Flag a monthly-plan line as a subscription, creating its record."""
+    r = one(con.execute("SELECT * FROM recurring WHERE id=?", (rid,)))
+    if not r:
+        return None
+    existing = sub_for_recurring(con, rid)
+    if existing:
+        con.execute("UPDATE subs SET active=1, in_plan=1 WHERE id=?", (existing["id"],))
+        con.commit()
+        return {"sub_id": existing["id"], "created": False}
+    today = datetime.date.today()
+    if not next_date:
+        day = min(r["due_day"] or 1, 28)
+        nxt = today.replace(day=day)
+        if nxt < today:
+            nxt = (nxt.replace(day=1) + datetime.timedelta(days=32)).replace(day=day)
+        next_date = nxt.isoformat()
+    sid = con.execute(
+        "INSERT INTO subs(label,amount,period,next_date,category,account,active,"
+        " started,note,recurring_id,in_plan)"
+        " VALUES(?,?,?,?,?,'Compte',1,?,?,?,1)",
+        (r["label"], r["amount"], period, next_date, r["category"],
+         today.replace(day=1).isoformat(), "created from the monthly plan", rid)).lastrowid
+    con.commit()
+    return {"sub_id": sid, "created": True}
+
+
+def saving_kinds(con):
+    return [r["name"] for r in rows(con.execute(
+        "SELECT name FROM kinds WHERE is_saving=1"))]
+
+
+# Every transaction has an effective budget type: the kind of the envelope it
+# was booked to, or a pseudo-type when it was not booked to one at all.
+TKIND_SQL = ("COALESCE(e.kind, CASE WHEN t.oneoff=1 THEN 'oneoff'"
+             " ELSE 'unassigned' END)")
+
+TX_FROM = " FROM tx t LEFT JOIN envelopes e ON e.id = t.envelope_id "
+
+
+def tx_where(p):
+    """Build the WHERE clause shared by the transaction list and the reports.
+
+    `cats` and `kinds` are lists. Inside each list the members are OR'd (any of
+    these categories), and the two lists are combined with `logic`, so you can
+    ask for "Food AND one-off" or "Food OR one-off".
+    """
+    where, args = ["1=1"], []
+
+    if p.get("start"):
+        where.append("t.date >= ?"); args.append(p["start"])
+    if p.get("end"):
+        where.append("t.date <= ?"); args.append(p["end"])
+    if p.get("account"):
+        where.append("t.account = ?"); args.append(p["account"])
+    if p.get("kind"):                       # expense / income
+        where.append("t.kind = ?"); args.append(p["kind"])
+    if p.get("envelope_id"):
+        where.append("t.envelope_id = ?"); args.append(p["envelope_id"])
+    if p.get("oneoff") not in (None, ""):
+        where.append("t.oneoff = ?"); args.append(int(p["oneoff"]))
+    if p.get("q"):
+        where.append("(t.label LIKE ? OR t.note LIKE ? OR t.payee LIKE ?)")
+        term = "%" + p["q"] + "%"
+        args += [term, term, term]
+
+    cats = [c for c in (p.get("cats") or []) if c]
+    knds = [k for k in (p.get("kinds") or []) if k]
+    cat_sql = ("t.category IN (%s)" % ",".join("?" * len(cats))) if cats else None
+    knd_sql = ("%s IN (%s)" % (TKIND_SQL, ",".join("?" * len(knds)))) if knds else None
+
+    if cat_sql and knd_sql:
+        op = " OR " if str(p.get("logic", "and")).lower() == "or" else " AND "
+        where.append("(" + cat_sql + op + knd_sql + ")")
+        args += cats + knds
+    elif cat_sql:
+        where.append(cat_sql); args += cats
+    elif knd_sql:
+        where.append(knd_sql); args += knds
+
+    return " AND ".join(where), args
+
+
+# ---------- month provisioning ----------
+
+def ensure_month(con, ym):
+    """Get or create a month, materialising active recurring items as envelopes."""
+    row = one(con.execute("SELECT * FROM months WHERE ym=?", (ym,)))
+    if row:
+        return row
+    s = one(con.execute("SELECT value FROM settings WHERE key='default_income'"))
+    income = float(s["value"] or 0) if s else 0.0
+    prev = one(con.execute("SELECT * FROM months WHERE ym=?", (ym_add(ym, -1),)))
+    if prev:
+        income = prev["income"]
+    cur = con.execute("INSERT INTO months(ym,income) VALUES(?,?)", (ym, income))
+    mid = cur.lastrowid
+    for r in rows(con.execute("SELECT * FROM recurring WHERE active=1 ORDER BY sort, id")):
+        con.execute(
+            "INSERT OR IGNORE INTO envelopes"
+            " (month_id,recurring_id,label,category,kind,planned,sort)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (mid, r["id"], r["label"], r["category"], r["kind"], r["amount"], r["sort"]))
+    con.commit()
+    return one(con.execute("SELECT * FROM months WHERE ym=?", (ym,)))
+
+
+def sync_months_from(con, ym):
+    """Give every open month from `ym` onward any active line it is missing.
+
+    Months are created lazily, so by the time you add something you may already
+    have generated next month by looking at it. Those months have to be caught
+    up too, or the new line would only ever exist in one of them.
+    Closed months are never touched.
+    """
+    now = datetime.date.today().strftime("%Y-%m")
+    if ym >= now:
+        ensure_month(con, ym)          # never invent a month that is in the past
+    touched = []
+    for m in rows(con.execute(
+            "SELECT ym FROM months WHERE closed=0 AND ym>=? ORDER BY ym", (ym,))):
+        if sync_month(con, m["ym"]).get("added"):
+            touched.append(m["ym"])
+    return touched
+
+
+def sync_month(con, ym):
+    """Add envelopes for recurring items created after the month was opened.
+
+    Closed months are left alone - history must not change under you.
+    """
+    m = ensure_month(con, ym)
+    if m["closed"]:
+        return {"added": 0, "skipped": "month is closed"}
+    have = set(r["label"] for r in rows(con.execute(
+        "SELECT label FROM envelopes WHERE month_id=?", (m["id"],))))
+    added = 0
+    for r in rows(con.execute("SELECT * FROM recurring WHERE active=1 ORDER BY sort, id")):
+        if r["label"] not in have:
+            con.execute(
+                "INSERT INTO envelopes(month_id,recurring_id,label,category,kind,planned,sort)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (m["id"], r["id"], r["label"], r["category"], r["kind"], r["amount"], r["sort"]))
+            added += 1
+    con.commit()
+    return {"added": added}
+
+
+# ---------- the month view ----------
+
+def month_view(con, ym):
+    m = ensure_month(con, ym)
+    d0, d1 = month_bounds(ym)
+
+    envs = rows(con.execute(
+        "SELECT e.*,"
+        " COALESCE((SELECT SUM(t.amount) FROM tx t"
+        "   WHERE t.envelope_id=e.id AND t.kind='expense'),0) AS spent,"
+        " (SELECT COUNT(*) FROM tx t WHERE t.envelope_id=e.id) AS n_tx"
+        " FROM envelopes e WHERE e.month_id=? ORDER BY e.sort, e.id", (m["id"],)))
+    for e in envs:
+        e["remaining"] = round(e["planned"] + e["rollover"] - e["spent"], 2)
+        if e["planned"]:
+            e["pct"] = round(100 * e["spent"] / e["planned"], 1)
+        else:
+            e["pct"] = 100.0 if e["spent"] else 0.0
+        e["over"] = e["spent"] > e["planned"] + e["rollover"] + 0.005
+
+    oneoffs = rows(con.execute(
+        "SELECT * FROM tx WHERE date BETWEEN ? AND ? AND kind='expense' AND oneoff=1"
+        " ORDER BY date DESC, id DESC", (d0, d1)))
+
+    unassigned = rows(con.execute(
+        "SELECT * FROM tx WHERE date BETWEEN ? AND ? AND kind='expense'"
+        " AND oneoff=0 AND envelope_id IS NULL ORDER BY date DESC, id DESC", (d0, d1)))
+
+    extra_in = one(con.execute(
+        "SELECT COALESCE(SUM(amount),0) s FROM tx"
+        " WHERE date BETWEEN ? AND ? AND kind='income'", (d0, d1)))["s"]
+
+    sav = saving_kinds(con)
+    planned = sum(e["planned"] for e in envs)
+    env_spent = sum(e["spent"] for e in envs)
+    off_spent = sum(t["amount"] for t in oneoffs)
+    un_spent = sum(t["amount"] for t in unassigned)
+    saved = sum(e["spent"] for e in envs if e["kind"] in sav)
+    income = m["income"] + m["extra_income"] + extra_in
+
+    by_cat = {}
+    for t in rows(con.execute(
+            "SELECT category, SUM(amount) s FROM tx"
+            " WHERE date BETWEEN ? AND ? AND kind='expense'"
+            " GROUP BY category ORDER BY s DESC", (d0, d1))):
+        by_cat[t["category"]] = round(t["s"], 2)
+
+    n_tx = one(con.execute(
+        "SELECT COUNT(*) c FROM tx WHERE date BETWEEN ? AND ?", (d0, d1)))["c"]
+
+    return {
+        "month": dict(m),
+        "ym": ym,
+        "label": ym_label(ym),
+        "envelopes": envs,
+        "oneoffs": oneoffs,
+        "unassigned": unassigned,
+        "by_category": by_cat,
+        "totals": {
+            "income": round(income, 2),
+            "base_income": round(m["income"], 2),
+            "extra_income": round(m["extra_income"] + extra_in, 2),
+            "planned": round(planned, 2),
+            "planned_left": round(max(0.0, planned - env_spent), 2),
+            "envelope_spent": round(env_spent, 2),
+            "oneoff_spent": round(off_spent, 2),
+            "unassigned_spent": round(un_spent, 2),
+            "total_spent": round(env_spent + off_spent + un_spent, 2),
+            "saved": round(saved, 2),
+            "committed": round(planned + off_spent, 2),
+            "free": round(income - (planned + off_spent), 2),
+            "left_to_spend": round(income - (env_spent + off_spent + un_spent), 2),
+            "n_tx": n_tx,
+        },
+    }
+
+
+# ---------- dashboard ----------
+
+def dashboard(con, ym):
+    mv = month_view(con, ym)
+
+    trend = []
+    for i in range(11, -1, -1):
+        y = ym_add(ym, -i)
+        d0, d1 = month_bounds(y)
+        s = one(con.execute(
+            "SELECT COALESCE(SUM(amount),0) s FROM tx"
+            " WHERE date BETWEEN ? AND ? AND kind='expense'", (d0, d1)))["s"]
+        mrow = one(con.execute("SELECT income,extra_income FROM months WHERE ym=?", (y,)))
+        inc = (mrow["income"] + mrow["extra_income"]) if mrow else 0.0
+        trend.append({"ym": y, "spent": round(s, 2), "income": round(inc, 2),
+                      "net": round(inc - s, 2)})
+
+    debts = debt_summary(con)
+
+    subs = rows(con.execute("SELECT * FROM subs WHERE active=1 ORDER BY next_date"))
+    per_month = sum(monthly_cost(s["amount"], s["period"]) for s in subs)
+    # what part of that is already inside the month's planned total
+    in_plan = sum(monthly_cost(s["amount"], s["period"]) for s in subs if s["in_plan"])
+    soon = (datetime.date.today() + datetime.timedelta(days=14)).isoformat()
+    due_soon = [s for s in subs if s["next_date"] and s["next_date"] <= soon]
+
+    bal = rows(con.execute(
+        "SELECT b.account, b.amount, b.ym FROM balances b"
+        " WHERE b.ym = (SELECT MAX(ym) FROM balances b2 WHERE b2.account=b.account)"
+        " ORDER BY b.account"))
+    net_worth = sum(b["amount"] for b in bal)
+
+    recent = rows(con.execute("SELECT * FROM tx ORDER BY date DESC, id DESC LIMIT 12"))
+
+    top = rows(con.execute(
+        "SELECT label, category, SUM(amount) s, COUNT(*) n FROM tx"
+        " WHERE date BETWEEN ? AND ? AND kind='expense'"
+        " GROUP BY LOWER(label) ORDER BY s DESC LIMIT 8", month_bounds(ym)))
+
+    sav = saving_kinds(con)
+    alerts = []
+    for e in mv["envelopes"]:
+        if e["over"]:
+            gap = e["spent"] - e["planned"] - e["rollover"]
+            alerts.append({"level": "danger",
+                           "text": "%s over budget by %.2f" % (e["label"], gap)})
+        elif e["planned"] and e["pct"] >= 85 and e["kind"] not in sav:
+            alerts.append({"level": "warn",
+                           "text": "%s at %.0f%% of budget" % (e["label"], e["pct"])})
+    if mv["unassigned"]:
+        alerts.append({"level": "warn",
+                       "text": "%d transaction(s) not assigned to any envelope"
+                               % len(mv["unassigned"])})
+    if mv["totals"]["left_to_spend"] < 0:
+        alerts.append({"level": "danger",
+                       "text": "Spent %.2f more than income this month"
+                               % abs(mv["totals"]["left_to_spend"])})
+    for s in due_soon:
+        alerts.append({"level": "info",
+                       "text": "%s (%.2f) renews %s" % (s["label"], s["amount"], s["next_date"])})
+    for d in debts["overdue"]:
+        alerts.append({"level": "warn",
+                       "text": "%s - %s overdue since %s"
+                               % (d["person"], d["reason"] or "debt", d["due_date"])})
+
+    return {
+        "month": mv,
+        "trend": trend,
+        "debts": debts,
+        "subs": {"count": len(subs), "per_month": round(per_month, 2),
+                 "per_year": round(per_month * 12, 2), "due_soon": due_soon,
+                 "in_plan": round(in_plan, 2),
+                 "outside_plan": round(per_month - in_plan, 2)},
+        "balances": bal,
+        "net_worth": round(net_worth, 2),
+        "recent": recent,
+        "top": top,
+        "alerts": alerts,
+        "today": datetime.date.today().isoformat(),
+    }
+
+
+# ---------- debts ----------
+
+def debt_summary(con):
+    ds = rows(con.execute(
+        "SELECT d.*, COALESCE((SELECT SUM(p.amount) FROM debt_payments p"
+        "  WHERE p.debt_id=d.id),0) AS paid"
+        " FROM debts d ORDER BY d.date DESC"))
+    today = datetime.date.today().isoformat()
+    overdue = []
+    for d in ds:
+        d["outstanding"] = round(d["amount"] - d["paid"], 2)
+        if d["status"] == "open" and d["outstanding"] <= 0.005:
+            d["status"] = "settled"
+            con.execute("UPDATE debts SET status='settled' WHERE id=?", (d["id"],))
+        if d["status"] == "open" and d["due_date"] and d["due_date"] < today:
+            overdue.append(d)
+    con.commit()
+
+    openn = [d for d in ds if d["status"] == "open"]
+    they = sum(d["outstanding"] for d in openn if d["direction"] == "they_owe")
+    i_owe = sum(d["outstanding"] for d in openn if d["direction"] == "i_owe")
+
+    people = {}
+    for d in openn:
+        p = people.setdefault(d["person"], {"person": d["person"], "they_owe": 0.0,
+                                            "i_owe": 0.0, "items": 0})
+        p[d["direction"]] += d["outstanding"]
+        p["items"] += 1
+    for p in people.values():
+        p["net"] = round(p["they_owe"] - p["i_owe"], 2)
+        p["they_owe"] = round(p["they_owe"], 2)
+        p["i_owe"] = round(p["i_owe"], 2)
+
+    return {
+        "all": ds,
+        "open": openn,
+        "they_owe_me": round(they, 2),
+        "i_owe": round(i_owe, 2),
+        "net": round(they - i_owe, 2),
+        "people": sorted(people.values(), key=lambda x: -abs(x["net"])),
+        "overdue": overdue,
+    }
+
+
+# ---------- reports ----------
+
+def report(con, p):
+    """Spending analysis over a date range, honouring the category/type filter."""
+    p = dict(p)
+    p.setdefault("kind", "expense")
+    where, args = tx_where(p)
+
+    def q(sql, extra=()):
+        return rows(con.execute(sql % (TX_FROM, where), args + list(extra)))
+
+    cats = q("SELECT t.category, SUM(t.amount) total, COUNT(*) n %s WHERE %s"
+             " GROUP BY t.category ORDER BY total DESC")
+    kinds = q("SELECT " + TKIND_SQL + " tkind, SUM(t.amount) total, COUNT(*) n"
+              " %s WHERE %s GROUP BY tkind ORDER BY total DESC")
+    months = q("SELECT substr(t.date,1,7) ym, SUM(t.amount) total, COUNT(*) n"
+               " %s WHERE %s GROUP BY 1 ORDER BY 1")
+    payees = q("SELECT t.label, t.category, SUM(t.amount) total, COUNT(*) n"
+               " %s WHERE %s GROUP BY LOWER(t.label) ORDER BY total DESC LIMIT 25")
+    # the cross-tab: category on one axis, budget type on the other
+    matrix = q("SELECT t.category, " + TKIND_SQL + " tkind,"
+               " SUM(t.amount) total, COUNT(*) n %s WHERE %s GROUP BY 1,2")
+
+    total = sum(c["total"] for c in cats)
+    for c in cats:
+        c["pct"] = round(100 * c["total"] / total, 1) if total else 0
+    for k in kinds:
+        k["pct"] = round(100 * k["total"] / total, 1) if total else 0
+
+    n_tx = sum(c["n"] for c in cats)
+    span = max(1, len(months))
+    return {
+        "categories": cats,
+        "kinds": kinds,
+        "months": months,
+        "payees": payees,
+        "matrix": matrix,
+        "total": round(total, 2),
+        "n_tx": n_tx,
+        "avg_month": round(total / span, 2),
+        "avg_tx": round(total / n_tx, 2) if n_tx else 0,
+        "start": p.get("start"), "end": p.get("end"),
+    }

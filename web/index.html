@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GestionMoney</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128176;</text></svg>">
+</head>
+<body>
+<div id="app">
+  <nav id="side">
+    <h1>Gestion<span>Money</span></h1>
+    <div id="profbox"></div>
+    <button class="nav" data-v="dash">Dashboard <span class="k">1</span></button>
+    <button class="nav" data-v="month">Month plan <span class="k">2</span></button>
+    <button class="nav" data-v="tx">Transactions <span class="k">3</span></button>
+    <button class="nav" data-v="subs">Subscriptions <span class="k">4</span></button>
+    <button class="nav" data-v="debts">Debts <span class="k">5</span></button>
+    <button class="nav" data-v="recurring">Fixed &amp; budgets <span class="k">6</span></button>
+    <button class="nav" data-v="reports">Reports <span class="k">7</span></button>
+    <button class="nav" data-v="cats">Categories &amp; types <span class="k">8</span></button>
+    <button class="nav" data-v="settings">Settings <span class="k">9</span></button>
+    <div class="hr"></div>
+    <button class="btn sm sec" style="width:100%" id="quickAdd">+ Add expense <span class="k">A</span></button>
+  </nav>
+  <main id="main"><div class="empty">Loading…</div></main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

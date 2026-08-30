@@ -1,0 +1,23 @@
+# Your money. Never goes to git.
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# The source spreadsheet, if you drop it in here
+*.xlsx
+*.xls
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
