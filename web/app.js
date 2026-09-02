@@ -326,7 +326,7 @@ async function vMonth(root) {
       </div>
       <table><thead><tr><th>Envelope</th><th>Category</th><th>Type</th>
         <th class="num">Planned</th><th class="num">Spent</th><th class="num">Left</th>
-        <th>Repeats</th><th></th></tr></thead>
+        <th></th><th>Repeats</th><th></th></tr></thead>
       <tbody>${d.envelopes.map(e => `<tr>
         <td><input class="ef w200" data-id="${e.id}" data-f="label" data-rec="${e.recurring_id || ''}"
              value="${esc(e.label)}" title="Rename it here - its transactions follow automatically"></td>
@@ -336,6 +336,10 @@ async function vMonth(root) {
         <td class="num"><input type="number" step="0.01" class="w90 ep" data-id="${e.id}" value="${n2(e.planned)}"></td>
         <td class="num ${e.over ? 'bad' : ''}">${money(e.spent)}</td>
         <td class="num ${e.remaining < 0 ? 'bad' : 'dim'}">${money(e.remaining)}</td>
+        <td>${e.remaining > 0.005
+            ? `<button class="btn sm" data-payenv="${e.id}" data-remaining="${e.remaining}"
+                 data-lb="${esc(e.label)}" data-cat="${esc(e.category)}" title="Log a payment against this envelope">Paid</button>`
+            : (e.spent > 0 ? '<span class="tag g" title="Fully paid">✓ paid</span>' : '')}</td>
         <td>${e.recurring_id
             ? '<span class="tag g" title="Comes from your master list, so every month gets it">every month</span>'
             : `<button class="btn sm sec" data-mkrec="${e.id}" title="Keep it from now on">${ymLabel(S.ym).split(' ')[0]} only · make regular</button>`}</td>
@@ -343,7 +347,7 @@ async function vMonth(root) {
       </tr>`).join('')}</tbody>
       <tfoot><tr><th colspan="3">Total</th>
         <th class="num">${money(t.planned)}</th><th class="num">${money(t.envelope_spent)}</th>
-        <th class="num">${money(t.planned - t.envelope_spent)}</th><th colspan="2"></th></tr></tfoot></table>
+        <th class="num">${money(t.planned - t.envelope_spent)}</th><th colspan="3"></th></tr></tfoot></table>
       <div class="hr"></div>
       <h3>Add something to ${ymLabel(S.ym)}</h3>
       <div class="form" style="margin-bottom:8px">
@@ -434,6 +438,24 @@ async function vMonth(root) {
     if (!confirm('Keep this line every month from now on?\n\nIt joins your master list, so future months are built with it.')) return;
     await POST('envelopes/' + b.dataset.mkrec + '/make-regular', {});
     toast('Now part of every month'); render();
+  });
+  // One click logs a payment against an envelope, prefilled with what is left
+  // to pay so a fixed bill (Loyer, Darna, Forfait Mobile...) is just click ->
+  // Enter. The amount stays editable in the prompt for bills that vary
+  // month to month (Engie, water...).
+  $$('[data-payenv]').forEach(b => b.onclick = async () => {
+    const remaining = +b.dataset.remaining;
+    const v = prompt('Pay "' + b.dataset.lb + '" - amount:', n2(remaining));
+    if (v === null) return;
+    const amt = +v;
+    if (!amt || amt <= 0) return toast('Enter an amount', true);
+    await POST('tx', {
+      date: clampDate(), label: b.dataset.lb, amount: amt,
+      envelope_id: b.dataset.payenv, category: b.dataset.cat,
+      account: S.accounts[0] || 'Compte', kind: 'expense', oneoff: 0,
+    });
+    toast('Paid ' + money(amt) + ' — ' + b.dataset.lb);
+    render();
   });
   $('#sync').onclick = async () => {
     const r = await POST('month/sync', { ym: S.ym });
@@ -987,7 +1009,7 @@ function matrixTable(r) {
   if (!r.matrix.length) return '<div class="empty">No data in this range</div>';
   const ks = r.kinds.map(k => k.tkind);
   const cell = {};
-  r.matrix.forEach(m => { cell[m.category + ' ' + m.tkind] = m; });
+  r.matrix.forEach(m => { cell[m.category + ' ' + m.tkind] = m; });
   const max = Math.max(...r.matrix.map(m => m.total));
 
   const head = `<tr><th>Category</th>${ks.map(k =>
@@ -996,7 +1018,7 @@ function matrixTable(r) {
 
   const body = r.categories.map(c => {
     const tds = ks.map(k => {
-      const m = cell[c.category + ' ' + k];
+      const m = cell[c.category + ' ' + k];
       if (!m) return '<td class="num dim2">·</td>';
       // shade the cell by how big it is relative to the biggest one
       const a = 0.08 + 0.42 * (m.total / max);

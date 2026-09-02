@@ -144,6 +144,25 @@ Two rules hold everywhere:
 - **A month where the line is already paid keeps what you paid.** A price rise
   updates the months you have not spent in yet, and leaves settled ones alone.
 
+### Paying a bill
+
+Every envelope in Month plan has a **Paid** button. Click it and a box pops up
+prefilled with what is left to pay:
+
+- a fixed bill (Loyer, Darna, Forfait Mobile, Fibre Optique...) is click ->
+  Enter, since the prefilled amount is already correct
+- a bill that varies (Engie, water...) - just type the real amount over the
+  prefilled one before confirming
+
+Either way it logs a real transaction against that envelope, dated today, so
+it counts the same as if you had typed it into Transactions by hand - no
+separate "mark as paid" flag to fall out of sync with what you actually spent.
+
+Once an envelope has nothing left to pay, the button is replaced by a
+✓ paid tag. Paying more than once (a partial payment now, the rest later) is
+fine - each click logs against whatever is still left, and the button
+disappears once it reaches zero.
+
 ### Renaming an envelope
 
 In **Month plan** the name, category and type are all editable in place — click
