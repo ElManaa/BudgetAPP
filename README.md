@@ -180,6 +180,37 @@ should apply to future months too:
 Two envelopes in the same month cannot share a name; you get a plain message
 saying so rather than an error.
 
+### A full bill is green, not amber
+
+A budget type now says how it should be judged at 100%, via **Reaching 100%**
+in Categories & types:
+
+| Setting | Meaning |
+|---|---|
+| **is the goal (a bill)** | fully paid = green. Reaching 100% is the point. |
+| **warn as it fills up** | amber from 85%, since it is an allowance meant to last the month. |
+
+Bills and savings are seeded as *is the goal*, so paying a bill in full — or
+hitting your savings target — shows green, not a warning. Going **over** is
+always flagged in red regardless of this setting; the distinction is only
+about what a full, on-target envelope should look like.
+
+### Covering a budget that went negative
+
+When an envelope goes over, its **Paid** button becomes **Cover €X** in Month
+plan. Click it and pick where the money comes from:
+
+- **money not yet allocated this month** — whatever is left of your income
+  once every planned envelope and one-off is accounted for, or
+- **another budget** that still has room, with the amount editable in case you
+  only want to move part of it.
+
+Either way it is a real transfer: it moves that month's actual allowance
+between envelopes (or in from unallocated income), and writes a transaction on
+both sides so the move is visible in each envelope's history. It never touches
+`spent`, so nothing is double-counted as new spending, and the source envelope
+cannot be pulled past what it actually has left.
+
 ## If you ever see "database is locked"
 
 It means two copies of the server were running at once. The app now refuses to

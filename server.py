@@ -83,7 +83,7 @@ TABLES = {
     "months": ["income", "extra_income", "note", "closed"],
     "balances": ["account", "ym", "amount"],
     "categories": ["name", "color", "sort", "archived"],
-    "kinds": ["name", "label", "is_saving", "color", "sort", "archived"],
+    "kinds": ["name", "label", "is_saving", "is_fixed", "color", "sort", "archived"],
 }
 
 # Where a category / budget-type name is stored, so a rename can follow it.
@@ -94,7 +94,7 @@ KIND_REFS = [("envelopes", "kind"), ("recurring", "kind")]
 NUMERIC = {"amount", "planned", "rollover", "income", "extra_income"}
 INTEGER = {"active", "sort", "oneoff", "closed", "due_day",
            "envelope_id", "sub_id", "debt_id", "month_id",
-           "archived", "is_saving"}
+           "archived", "is_saving", "is_fixed"}
 
 
 def csv_list(q, key):
@@ -534,6 +534,12 @@ class Handler(BaseHTTPRequestHandler):
         if route.startswith("envelopes/") and parts[-1] == "make-regular":
             r = api.promote_envelope(con, int(parts[1]))
             return self._send(200, r or {"error": "not found"})
+
+        if route == "envelopes/transfer" and verb == "POST":
+            r = api.transfer_between_envelopes(
+                con, body.get("ym") or db.ym_now(), body.get("to_id"),
+                body.get("amount"), body.get("from_id"))
+            return self._send(200, r)
 
         if route.startswith("recurring/") and parts[-1] == "stop-repeating":
             r = api.demote_recurring(con, int(parts[1]),

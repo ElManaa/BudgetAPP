@@ -88,6 +88,20 @@ const kindOpts = sel => selOpts(S.kinds, sel);
 const catColor = c => S.catColor[c] || '#94a3b8';
 const kindColor = k => (S.kindRows.find(x => x.name === k) || {}).color || '#94a3b8';
 const allKinds = () => S.kinds.concat(PSEUDO_KINDS.map(p => p.name));
+// Look up a kind's is_saving/is_fixed flags by name, never by string-matching
+// the name itself - kinds can be renamed (Bill -> "Loyer & co"), so anything
+// checking `=== 'bill'` silently breaks the moment someone does that.
+const kindMeta = k => S.kindRows.find(x => x.name === k) || { is_saving: 0, is_fixed: 0 };
+// Bills are meant to reach 100% - that is a solved payment, not a warning.
+// Savings are the same: hitting your monthly goal is good news. Only a plain
+// budget allowance should show amber as it climbs, and anything past 100%
+// (over) always means the same thing regardless of kind: it needs fixing.
+function envelopeStatus(e) {
+  if (e.over) return 'bad';
+  const km = kindMeta(e.kind);
+  if (km.is_saving || km.is_fixed) return 'ok';
+  return e.pct >= 85 ? 'warn' : 'ok';
+}
 
 /* ---------- reusable category / type filter ---------- */
 
@@ -227,8 +241,8 @@ async function vDash(root) {
       <div class="card"><h3>Latest transactions</h3>
         ${d.recent.length ? `<table><tbody>${d.recent.map(x => `<tr>
           <td class="dim2 mono" style="width:74px">${esc(x.date.slice(5))}</td>
-          <td>${esc(x.label)}</td>
-          <td class="num ${x.kind === 'income' ? 'ok' : ''}">${x.kind === 'income' ? '+' : ''}${money(x.amount)}</td>
+          <td>${esc(x.label)}${x.kind === 'transfer' ? ' <span class="tag p" style="font-size:10px">transfer</span>' : ''}</td>
+          <td class="num ${x.kind === 'income' ? 'ok' : x.kind === 'transfer' ? 'sv' : ''}">${x.kind === 'income' ? '+' : ''}${money(x.amount)}</td>
         </tr>`).join('')}</tbody></table>` : '<div class="empty">Nothing yet</div>'}
       </div>
       <div class="card"><h3>Accounts · net ${money(d.net_worth)}</h3>
@@ -245,7 +259,8 @@ async function vDash(root) {
 }
 
 function envRow(e) {
-  const cls = e.kind === 'saving' ? 'sv' : e.over ? 'bad' : e.pct >= 85 ? 'warn' : 'ok';
+  const km = kindMeta(e.kind);
+  const cls = km.is_saving ? 'sv' : envelopeStatus(e);
   const w = Math.min(100, e.planned ? 100 * e.spent / e.planned : (e.spent ? 100 : 0));
   return `<div class="env">
     <div class="nm" data-env="${e.id}" title="Click to see the ${e.n_tx} transaction(s)">
@@ -255,7 +270,7 @@ function envRow(e) {
     <div class="n dim">${money(e.planned)}</div>
     <div class="n">${money(e.spent)}</div>
     <div class="n ${e.remaining < 0 ? 'bad' : 'dim'}">${money(e.remaining)}</div>
-    <div class="n"><span class="tag ${e.kind === 'saving' ? 'p' : e.kind === 'budget' ? 'b' : ''}">${e.kind[0].toUpperCase()}</span></div>
+    <div class="n"><span class="tag" style="border-left:3px solid ${esc(km.color || '#94a3b8')}">${esc(e.kind)}</span></div>
   </div>`;
 }
 
@@ -339,6 +354,9 @@ async function vMonth(root) {
         <td>${e.remaining > 0.005
             ? `<button class="btn sm" data-payenv="${e.id}" data-remaining="${e.remaining}"
                  data-lb="${esc(e.label)}" data-cat="${esc(e.category)}" title="Log a payment against this envelope">Paid</button>`
+            : e.remaining < -0.005
+            ? `<button class="btn sm dgr" data-gap="${e.id}"
+                 title="This went over - pull the difference from another budget or this month's leftover">Cover ${money(-e.remaining)}</button>`
             : (e.spent > 0 ? '<span class="tag g" title="Fully paid">✓ paid</span>' : '')}</td>
         <td>${e.recurring_id
             ? '<span class="tag g" title="Comes from your master list, so every month gets it">every month</span>'
@@ -457,6 +475,14 @@ async function vMonth(root) {
     toast('Paid ' + money(amt) + ' — ' + b.dataset.lb);
     render();
   });
+  // An envelope that went negative needs the gap covered from somewhere real -
+  // either money this month never allocated to anything, or another budget
+  // that still has room. Either way it is a transfer inside the plan, not new
+  // spending, and it is a real transaction so the move stays visible.
+  $$('[data-gap]').forEach(b => b.onclick = () => {
+    const env = d.envelopes.find(x => String(x.id) === b.dataset.gap);
+    if (env) openSolveGap(env, d);
+  });
   $('#sync').onclick = async () => {
     const r = await POST('month/sync', { ym: S.ym });
     toast(r.added ? r.added + ' envelope(s) added' : 'Already up to date'); render();
@@ -510,7 +536,11 @@ function clampDate() {
 
 /* ================= TRANSACTIONS ================= */
 function txTable(items) {
-  const tk = t => t.tkind || (t.oneoff ? 'oneoff' : (t.envelope ? '' : 'unassigned'));
+  // a transfer is not a real spend or income - it just moves budget you
+  // already have between two envelopes - so it gets its own tag rather than
+  // borrowing the destination envelope's budget type, and no +/- on the amount.
+  const tk = t => t.kind === 'transfer' ? 'transfer'
+    : t.tkind || (t.oneoff ? 'oneoff' : (t.envelope ? '' : 'unassigned'));
   return `<div class="scroll"><table><thead><tr>
     <th style="width:96px">Date</th><th>What</th><th>Category</th><th>Type</th><th>Envelope</th>
     <th>Account</th><th class="num">Amount</th><th style="width:30px"></th></tr></thead>
@@ -518,11 +548,11 @@ function txTable(items) {
       <td class="dim mono">${esc(t.date)}</td>
       <td>${esc(t.label)}${t.note ? `<div class="dim2" style="font-size:11px">${esc(t.note)}</div>` : ''}</td>
       <td><span class="tag" style="border-left:3px solid ${catColor(t.category)}">${esc(t.category)}</span></td>
-      <td>${tk(t) ? `<span class="tag ${tk(t) === 'oneoff' ? 'y' : tk(t) === 'unassigned' ? 'r' : ''}"
-            ${['oneoff', 'unassigned'].includes(tk(t)) ? '' : `style="border-left:3px solid ${kindColor(tk(t))}"`}>${esc(tk(t))}</span>` : ''}</td>
+      <td>${tk(t) ? `<span class="tag ${tk(t) === 'oneoff' ? 'y' : tk(t) === 'unassigned' ? 'r' : tk(t) === 'transfer' ? 'p' : ''}"
+            ${['oneoff', 'unassigned', 'transfer'].includes(tk(t)) ? '' : `style="border-left:3px solid ${kindColor(tk(t))}"`}>${esc(tk(t))}</span>` : ''}</td>
       <td class="dim2">${t.envelope ? esc(t.envelope) : '—'}</td>
       <td class="dim2">${esc(t.account)}</td>
-      <td class="num ${t.kind === 'income' ? 'ok' : ''}">${t.kind === 'income' ? '+' : ''}${money(t.amount)}</td>
+      <td class="num ${t.kind === 'income' ? 'ok' : t.kind === 'transfer' ? 'sv' : ''}">${t.kind === 'income' ? '+' : ''}${money(t.amount)}</td>
       <td><button class="x" data-del-tx="${t.id}">&times;</button></td>
     </tr>`).join('')}</tbody></table></div>`;
 }
@@ -1077,9 +1107,13 @@ async function vCats(root) {
           <div class="fld"><label>Colour</label><input type="color" id="nkc" value="#3ecf8e" class="w70" style="padding:3px;height:36px"></div>
           <div class="fld"><label>Counts as</label><select id="nks" class="w130">
             <option value="0">spending</option><option value="1">money put aside</option></select></div>
+          <div class="fld"><label>Reaching 100%</label><select id="nkf" class="w160">
+            <option value="0">warn as it fills up</option>
+            <option value="1">is the goal (a bill)</option></select></div>
           <button class="btn" id="nk_go">Add</button>
         </div>
-        <table><thead><tr><th></th><th>Name</th><th>Counts as</th><th class="num">Used</th><th></th></tr></thead>
+        <table><thead><tr><th></th><th>Name</th><th>Counts as</th><th>Reaching 100%</th>
+          <th class="num">Used</th><th></th></tr></thead>
         <tbody>${kinds.map(k => `<tr style="${k.archived ? 'opacity:.45' : ''}">
           <td><input type="color" class="cf" data-t="kinds" data-id="${k.id}" data-f="color"
                value="${esc(k.color || '#94a3b8')}" style="width:30px;height:26px;padding:2px;border-radius:5px"></td>
@@ -1088,6 +1122,9 @@ async function vCats(root) {
           <td><select class="cf w130" data-t="kinds" data-id="${k.id}" data-f="is_saving">
             <option value="0"${k.is_saving ? '' : ' selected'}>spending</option>
             <option value="1"${k.is_saving ? ' selected' : ''}>money put aside</option></select></td>
+          <td><select class="cf w160" data-t="kinds" data-id="${k.id}" data-f="is_fixed">
+            <option value="0"${k.is_fixed ? '' : ' selected'}>warn as it fills up</option>
+            <option value="1"${k.is_fixed ? ' selected' : ''}>is the goal (a bill)</option></select></td>
           <td class="num dim">${k.n_env + k.n_rec}</td>
           <td style="white-space:nowrap">
             <button class="btn sm sec" data-arch="kinds" data-id="${k.id}" data-v="${k.archived ? 0 : 1}">${k.archived ? 'restore' : 'hide'}</button>
@@ -1097,6 +1134,10 @@ async function vCats(root) {
         <div class="dim2" style="font-size:11px;margin-top:10px">
           <b>Counts as</b> decides the dashboard's “Saved” figure: types marked
           <i>money put aside</i> are added up there instead of counting as spending.
+          <br><b>Reaching 100%</b> decides the warning colour: <i>is the goal</i>
+          means a full envelope is green (a paid bill), not amber — reserve
+          <i>warn as it fills up</i> for an allowance meant to last the month.
+          Going over is always flagged either way.
           <br>“one-off” and “unassigned” are automatic states, not types — they
           show up in filters and reports but cannot be edited here.</div>
       </div>
@@ -1113,7 +1154,8 @@ async function vCats(root) {
   $('#nk_go').onclick = () => {
     const v = $('#nk').value.trim();
     if (!v) return toast('Type a name first', true);
-    add('kinds', { name: v, label: v, color: $('#nkc').value, is_saving: $('#nks').value },
+    add('kinds', { name: v, label: v, color: $('#nkc').value,
+                   is_saving: $('#nks').value, is_fixed: $('#nkf').value },
         'Budget type added');
   };
   $$('.cf').forEach(el => {
@@ -1332,6 +1374,70 @@ async function renderAuthBox() {
   if ($('#pw_lock')) $('#pw_lock').onclick = async () => {
     await post('logout', {});
     location.reload();
+  };
+}
+
+/* ================= COVER A NEGATIVE ENVELOPE ================= */
+function openSolveGap(env, mv) {
+  const gap = Math.round(-env.remaining * 100) / 100;
+  const leftover = mv.totals.left_to_spend;
+  const useLeftover = Math.max(0, Math.min(gap, leftover));
+  const others = mv.envelopes
+    .filter(x => x.id !== env.id && x.remaining > 0.005)
+    .sort((a, b) => b.remaining - a.remaining);
+
+  const w = document.createElement('div');
+  w.className = 'modal';
+  w.innerHTML = `<div class="box">
+    <h3>Cover ${money(gap)} in "${esc(env.label)}"</h3>
+    <p class="dim" style="font-size:13px;margin-top:-8px;line-height:1.5">
+      This went ${money(gap)} over what was planned. Pick where it comes from -
+      this moves budget you already have, it does not add new spending.</p>
+    <div class="form" style="flex-direction:column;align-items:stretch">
+      ${leftover > 0.005 ? `
+      <button class="btn" id="sg_leftover" style="text-align:left;line-height:1.4">
+        Use money not yet allocated this month
+        <div style="font-weight:400;font-size:12px;opacity:.85">
+          ${money(useLeftover)} of ${money(leftover)} left this month</div>
+      </button>` : `
+      <div class="dim2" style="font-size:12px">Nothing is left unallocated this
+        month, so this has to come from another budget.</div>`}
+      ${others.length ? `
+      <div class="hr"></div>
+      <div class="fld"><label>Or pull it from another budget</label>
+        <select id="sg_from"><option value="">choose one…</option>
+          ${others.map(o => `<option value="${o.id}">${esc(o.label)} — ${money(o.remaining)} left</option>`).join('')}
+        </select>
+      </div>
+      <div class="fld"><label>Amount to move</label>
+        <input type="number" step="0.01" id="sg_amt" value="${n2(gap)}"></div>
+      <button class="btn sec" id="sg_go">Transfer &amp; solve</button>` : ''}
+      <button class="btn sec" id="sg_cancel">Cancel</button>
+    </div>
+  </div>`;
+  document.body.appendChild(w);
+  const close = () => w.remove();
+  w.onclick = e => { if (e.target === w) close(); };
+  document.addEventListener('keydown', function esc1(e) {
+    if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc1); }
+  });
+  $('#sg_cancel', w).onclick = close;
+
+  if ($('#sg_leftover', w)) $('#sg_leftover', w).onclick = async () => {
+    try {
+      await POST('envelopes/transfer', { ym: S.ym, to_id: env.id, amount: useLeftover });
+      close(); toast('Covered ' + money(useLeftover) + ' from unallocated income'); render();
+    } catch (e) { /* message already shown */ }
+  };
+  if ($('#sg_go', w)) $('#sg_go', w).onclick = async () => {
+    const fromId = $('#sg_from', w).value;
+    const amt = +$('#sg_amt', w).value;
+    if (!fromId) return toast('Pick a budget to pull from', true);
+    if (!amt || amt <= 0) return toast('Enter an amount', true);
+    try {
+      await POST('envelopes/transfer', { ym: S.ym, to_id: env.id, from_id: fromId, amount: amt });
+      close(); toast('Transferred ' + money(amt)); render();
+    } catch (e) { /* message already shown */ }
   };
 }
 

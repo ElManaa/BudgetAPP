@@ -139,6 +139,7 @@ CREATE TABLE IF NOT EXISTS kinds (
     name      TEXT NOT NULL UNIQUE,
     label     TEXT NOT NULL DEFAULT '',
     is_saving INTEGER NOT NULL DEFAULT 0,
+    is_fixed  INTEGER NOT NULL DEFAULT 0,
     color     TEXT NOT NULL DEFAULT '',
     sort      INTEGER NOT NULL DEFAULT 0,
     archived  INTEGER NOT NULL DEFAULT 0
@@ -165,10 +166,11 @@ DEFAULTS = {
                   "Gifts,Subscription,Savings,Debt,Family,Other",
 }
 
+# name, label, is_saving, is_fixed, color
 SEED_KINDS = [
-    ("bill", "Bill - fixed amount you must pay", 0, "#4f9cf9"),
-    ("budget", "Budget - an allowance you set", 0, "#3ecf8e"),
-    ("saving", "Saving - money put aside", 1, "#a78bfa"),
+    ("bill", "Bill - fixed amount you must pay", 0, 1, "#4f9cf9"),
+    ("budget", "Budget - an allowance you set", 0, 0, "#3ecf8e"),
+    ("saving", "Saving - money put aside", 1, 0, "#a78bfa"),
 ]
 
 PALETTE = ["#4f9cf9", "#3ecf8e", "#f5a524", "#f2545b", "#a78bfa", "#38bdf8",
@@ -324,9 +326,21 @@ def init(profile_id):
         con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
 
     if not con.execute("SELECT 1 FROM kinds LIMIT 1").fetchone():
-        for i, (name, label, sav, col) in enumerate(SEED_KINDS):
-            con.execute("INSERT OR IGNORE INTO kinds(name,label,is_saving,color,sort)"
-                        " VALUES(?,?,?,?,?)", (name, label, sav, col, i * 10))
+        for i, (name, label, sav, fixed, col) in enumerate(SEED_KINDS):
+            con.execute(
+                "INSERT OR IGNORE INTO kinds(name,label,is_saving,is_fixed,color,sort)"
+                " VALUES(?,?,?,?,?,?)", (name, label, sav, fixed, col, i * 10))
+
+    # A profile created before "is_fixed" existed has no way to know which of
+    # its kinds meant "bill" - even if you renamed it. Best guess: the
+    # non-saving kind that was seeded first (sort order is preserved across a
+    # rename). You can always correct it in Categories & types afterwards.
+    if add_column(con, "kinds", "is_fixed", "INTEGER NOT NULL DEFAULT 0"):
+        row = con.execute(
+            "SELECT id FROM kinds WHERE is_saving=0 AND archived=0"
+            " ORDER BY sort, id LIMIT 1").fetchone()
+        if row:
+            con.execute("UPDATE kinds SET is_fixed=1 WHERE id=?", (row["id"],))
 
     if not con.execute("SELECT 1 FROM categories LIMIT 1").fetchone():
         row = con.execute("SELECT value FROM settings WHERE key='categories'").fetchone()

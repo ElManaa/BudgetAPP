@@ -263,6 +263,87 @@ def saving_kinds(con):
         "SELECT name FROM kinds WHERE is_saving=1"))]
 
 
+def fixed_kinds(con):
+    """Kinds that behave like a bill: reaching 100% is the goal, not a warning."""
+    return [r["name"] for r in rows(con.execute(
+        "SELECT name FROM kinds WHERE is_fixed=1"))]
+
+
+def envelope_remaining(con, env_id):
+    """What is left in one envelope right now, independent of month_view."""
+    e = one(con.execute("SELECT planned, rollover FROM envelopes WHERE id=?", (env_id,)))
+    if not e:
+        return None
+    spent = one(con.execute(
+        "SELECT COALESCE(SUM(amount),0) s FROM tx"
+        " WHERE envelope_id=? AND kind='expense'", (env_id,)))["s"]
+    return round(e["planned"] + e["rollover"] - spent, 2)
+
+
+def transfer_between_envelopes(con, ym, to_id, amount, from_id=None):
+    """Move budget from one envelope into another that has gone negative.
+
+    This never creates or destroys money and never touches `spent`: it moves
+    `rollover`, the field that already exists precisely for "extra allowance
+    this month". A pair of kind='transfer' transactions is written purely so
+    the move is visible in that envelope's history - they are excluded from
+    every spending total because those all filter on kind='expense'.
+
+    With no `from_id`, the amount is assumed to come from income that was not
+    allocated to anything this month, capped at what is actually unspent.
+    """
+    m = ensure_month(con, ym)
+    to_env = one(con.execute(
+        "SELECT * FROM envelopes WHERE id=? AND month_id=?", (to_id, m["id"])))
+    if not to_env:
+        raise ValueError("That envelope was not found in this month.")
+
+    amount = round(float(amount or 0), 2)
+    if amount <= 0.005:
+        raise ValueError("Enter an amount greater than zero.")
+
+    today = datetime.date.today().isoformat()
+    acct_row = one(con.execute("SELECT value FROM settings WHERE key='accounts'"))
+    account = ((acct_row["value"] if acct_row else "").split(",") or ["Compte"])[0].strip() or "Compte"
+
+    if from_id:
+        from_id = int(from_id)
+        if from_id == int(to_id):
+            raise ValueError("Pick two different envelopes.")
+        from_env = one(con.execute(
+            "SELECT * FROM envelopes WHERE id=? AND month_id=?", (from_id, m["id"])))
+        if not from_env:
+            raise ValueError("The source envelope was not found in this month.")
+        avail = envelope_remaining(con, from_id)
+        if amount > avail + 0.005:
+            raise ValueError("\"%s\" only has %.2f left to give." % (from_env["label"], avail))
+        con.execute("UPDATE envelopes SET rollover = rollover - ? WHERE id=?",
+                    (amount, from_id))
+        con.execute(
+            "INSERT INTO tx(date,label,amount,kind,envelope_id,category,account,oneoff,note)"
+            " VALUES(?,?,?,'transfer',?,?,?,0,?)",
+            (today, "Transfer to " + to_env["label"], amount, from_id,
+             from_env["category"], account, "Covers " + to_env["label"]))
+        source_label = from_env["label"]
+    else:
+        mv = month_view(con, ym)
+        leftover = mv["totals"]["left_to_spend"]
+        if amount > leftover + 0.005:
+            raise ValueError(
+                "Only %.2f is left unallocated this month - pick a smaller "
+                "amount or pull the rest from another budget." % max(leftover, 0))
+        source_label = "unallocated income"
+
+    con.execute("UPDATE envelopes SET rollover = rollover + ? WHERE id=?",
+                (amount, to_id))
+    con.execute(
+        "INSERT INTO tx(date,label,amount,kind,envelope_id,category,account,oneoff,note)"
+        " VALUES(?,?,?,'transfer',?,?,?,0,'')",
+        (today, "Transfer from " + source_label, amount, to_id, to_env["category"], account))
+    con.commit()
+    return {"ok": True, "amount": amount, "to": to_env["label"], "from": source_label}
+
+
 # Every transaction has an effective budget type: the kind of the envelope it
 # was booked to, or a pseudo-type when it was not booked to one at all.
 TKIND_SQL = ("COALESCE(e.kind, CASE WHEN t.oneoff=1 THEN 'oneoff'"
@@ -392,12 +473,16 @@ def month_view(con, ym):
         " (SELECT COUNT(*) FROM tx t WHERE t.envelope_id=e.id) AS n_tx"
         " FROM envelopes e WHERE e.month_id=? ORDER BY e.sort, e.id", (m["id"],)))
     for e in envs:
-        e["remaining"] = round(e["planned"] + e["rollover"] - e["spent"], 2)
-        if e["planned"]:
-            e["pct"] = round(100 * e["spent"] / e["planned"], 1)
+        # a top-up (see transfer_between_envelopes) raises this month's real
+        # ceiling via rollover, so pct has to track that too - otherwise a
+        # resolved shortfall keeps reading as "still over 100%".
+        effective = e["planned"] + e["rollover"]
+        e["remaining"] = round(effective - e["spent"], 2)
+        if effective:
+            e["pct"] = round(100 * e["spent"] / effective, 1)
         else:
             e["pct"] = 100.0 if e["spent"] else 0.0
-        e["over"] = e["spent"] > e["planned"] + e["rollover"] + 0.005
+        e["over"] = e["spent"] > effective + 0.005
 
     oneoffs = rows(con.execute(
         "SELECT * FROM tx WHERE date BETWEEN ? AND ? AND kind='expense' AND oneoff=1"
@@ -496,13 +581,16 @@ def dashboard(con, ym):
         " GROUP BY LOWER(label) ORDER BY s DESC LIMIT 8", month_bounds(ym)))
 
     sav = saving_kinds(con)
+    fixed = fixed_kinds(con)
     alerts = []
     for e in mv["envelopes"]:
         if e["over"]:
             gap = e["spent"] - e["planned"] - e["rollover"]
             alerts.append({"level": "danger",
-                           "text": "%s over budget by %.2f" % (e["label"], gap)})
-        elif e["planned"] and e["pct"] >= 85 and e["kind"] not in sav:
+                           "text": "%s over budget by %.2f - cover it from another "
+                                   "budget or this month's leftover in Month plan"
+                                   % (e["label"], gap)})
+        elif e["planned"] and e["pct"] >= 85 and e["kind"] not in sav and e["kind"] not in fixed:
             alerts.append({"level": "warn",
                            "text": "%s at %.0f%% of budget" % (e["label"], e["pct"])})
     if mv["unassigned"]:
